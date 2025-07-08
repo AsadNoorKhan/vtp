@@ -1,0 +1,46 @@
+# Android/IntelliJ/Studio
+.idea/
+*.iml
+.gradle/
+build/
+*/build/
+local.properties
+.DS_Store
+*.apk
+*.ap_ 
+*.dex
+*.class
+*.log
+*.keystore
+*.jks
+*.cxx/
+*.hprof
+captures/
+output.json
+# OS generated files
+Thumbs.db
+Desktop.ini
+# Android Studio Navigation editor temp files
+.navigation/
+# Crashlytics
+crashlytics-build.properties
+# Google Services (e.g. google-services.json)
+google-services.json
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+# NDK
+obj/
+.externalNativeBuild/
+.cxx/
+# Gradle
+.gradle/
+# Misc
+*.orig
+*.rej
+*.sublime-workspace
+*.sublime-project
+# VS Code
+.vscode/
