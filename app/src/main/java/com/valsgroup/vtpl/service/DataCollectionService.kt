@@ -25,6 +25,11 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.text.SimpleDateFormat
 import java.util.*
+import android.os.Handler
+import android.os.Looper
+import android.telephony.PhoneStateListener
+import android.telephony.SignalStrength
+import android.location.GnssStatus
 
 class DataCollectionService : Service(), LocationListener {
     private lateinit var locationManager: LocationManager
@@ -38,6 +43,9 @@ class DataCollectionService : Service(), LocationListener {
     private var isCharging: Boolean = false
     private var authToken: String = "" // Store auth token
     private var isMainDataCollectionInProgress = false // Flag to pause offline sync during main data collection
+    private var satelliteCount: Int = 0
+    private var gsmSignalLevel: Int = 0
+    private var batteryVoltage: Float = 0.0f
 
     private val batteryReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -46,8 +54,12 @@ class DataCollectionService : Service(), LocationListener {
             batteryLevel = level * 100 / scale.toFloat()
             isCharging = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ==
                     BatteryManager.BATTERY_STATUS_CHARGING
-            
-            Log.d(TAG, "Battery update: Level=${batteryLevel}%, Charging=$isCharging")
+
+            // NEW: Get battery voltage
+            val voltage = intent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
+            batteryVoltage = voltage / 1000f // Convert mV to V
+
+            Log.d(TAG, "Battery update: Level=${batteryLevel}%, Charging=$isCharging, Voltage=${batteryVoltage}V")
         }
     }
 
@@ -90,6 +102,24 @@ class DataCollectionService : Service(), LocationListener {
         startLocationUpdates()
         startDataCollection()
             startOfflineSync()
+            
+            // NEW: Register GNSS status callback for satellites (API 24+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                locationManager.registerGnssStatusCallback(object : GnssStatus.Callback() {
+                    override fun onSatelliteStatusChanged(status: GnssStatus) {
+                        satelliteCount = status.satelliteCount
+                        Log.d(TAG, "GNSS satellites: $satelliteCount")
+                    }
+                }, Handler(Looper.getMainLooper()))
+            }
+
+            // NEW: Register PhoneStateListener for GSM signal level
+            telephonyManager.listen(object : PhoneStateListener() {
+                override fun onSignalStrengthsChanged(signalStrength: SignalStrength?) {
+                    gsmSignalLevel = signalStrength?.level ?: 0 // 0-4 (API 23+)
+                    Log.d(TAG, "GSM signal level: $gsmSignalLevel")
+                }
+            }, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS)
             
             Log.d(TAG, "✅ Service initialization completed")
         } catch (e: Exception) {
@@ -304,12 +334,12 @@ class DataCollectionService : Service(), LocationListener {
                         latitude = String.format(Locale.US, "%.7f", location.latitude).toDouble(),
                         longitude = String.format(Locale.US, "%.7f", location.longitude).toDouble(),
                         altitude = String.format(Locale.US, "%.7f", location.altitude).toDouble().toInt(),
-                        satellites = 18, // Hardcoded as we can't get this easily
-                        gsm_signal_level = 3, // Hardcoded as we can't get this easily
+                        satellites = satelliteCount, // DYNAMIC
+                        gsm_signal_level = gsmSignalLevel, // DYNAMIC
                         battery_power = if (isCharging) "Y" else "N",
                         battery_level = batteryLevel.toInt(),
-                        battery_voltage = 4.2f, // Hardcoded typical battery voltage
-                        external_voltage = 0.0f // Hardcoded as we don't have external power
+                        battery_voltage = batteryVoltage, // DYNAMIC
+                        external_voltage = 0.0f // Still hardcoded
                     )
 
                     Log.d(TAG, "📡 Main data collection: Phone=${deviceData.imei_id}, Date=${deviceData.device_date}, Lat=${"%.4f".format(deviceData.latitude)}, Lng=${"%.4f".format(deviceData.longitude)}")
