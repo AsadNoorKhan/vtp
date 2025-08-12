@@ -33,7 +33,7 @@ import android.widget.ArrayAdapter
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.commit
 import com.valsgroup.vtpl.screens.PhoneNumberEntryFragment
-import com.valsgroup.vtpl.screens.MainFragment
+import com.valsgroup.vtpl.screens.TrackingFragment
 
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,16 +42,18 @@ class MainActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences("VTPL_PREFS", Context.MODE_PRIVATE)
         val storedPhoneNumber = prefs.getString("PHONE_NUMBER", null)
-
+        
         if (savedInstanceState == null) {
             if (storedPhoneNumber == null) {
-                supportFragmentManager.commit {
-                    replace(R.id.fragment_container, PhoneNumberEntryFragment())
-                }
+                // Show phone number entry first
+                supportFragmentManager.beginTransaction()
+                    .replace(R.id.fragment_container, PhoneNumberEntryFragment())
+                    .commit()
             } else {
-                supportFragmentManager.commit {
-                    replace(R.id.fragment_container, MainFragment())
-                }
+                // Phone number already entered, show tracking
+                supportFragmentManager.beginTransaction()
+                    .replace(R.id.fragment_container, TrackingFragment())
+                    .commit()
             }
         }
     }

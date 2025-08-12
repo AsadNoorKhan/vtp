@@ -3,65 +3,47 @@ package com.valsgroup.vtpl.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
-import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
-import android.provider.Settings
-import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.valsgroup.vtpl.MainActivity
-import com.valsgroup.vtpl.R
 import com.valsgroup.vtpl.api.ApiService
 import com.valsgroup.vtpl.api.DeviceData
 import com.valsgroup.vtpl.database.TrackingDatabase
-import com.valsgroup.vtpl.utils.NetworkUtils
+import com.valsgroup.vtpl.utils.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.text.SimpleDateFormat
 import java.util.*
-import android.os.Handler
-import android.os.Looper
-import android.telephony.PhoneStateListener
-import android.telephony.SignalStrength
-import android.location.GnssStatus
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 
-class DataCollectionService : Service(), LocationListener {
-    private lateinit var locationManager: LocationManager
-    private lateinit var telephonyManager: TelephonyManager
+class DataCollectionService : Service() {
     private lateinit var apiService: ApiService
     private lateinit var database: TrackingDatabase
-    private var job: Job? = null
+    
+    // Modularized monitors
+    private lateinit var batteryMonitor: BatteryMonitor
+    private lateinit var signalMonitor: SignalMonitor
+    private lateinit var satelliteMonitor: SatelliteMonitor
+    private lateinit var locationManager: com.valsgroup.vtpl.utils.LocationManager
+    
+    // Coroutine scope for the service
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var locationCheckJob: Job? = null
     private var syncJob: Job? = null
+    private var locationJob: Job? = null
+    
     private var currentLocation: Location? = null
-    private var batteryLevel: Float = 0f
-    private var isCharging: Boolean = false
-    private var authToken: String = "" // Store auth token
-    private var isMainDataCollectionInProgress = false // Flag to pause offline sync during main data collection
-    private var satelliteCount: Int = 0
-    private var gsmSignalLevel: Int = 0
-    private var batteryVoltage: Float = 0.0f
-
-    private val batteryReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-            batteryLevel = level * 100 / scale.toFloat()
-            isCharging = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ==
-                    BatteryManager.BATTERY_STATUS_CHARGING
-
-            // NEW: Get battery voltage
-            val voltage = intent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
-            batteryVoltage = voltage / 1000f // Convert mV to V
-
-            Log.d(TAG, "Battery update: Level=${batteryLevel}%, Charging=$isCharging, Voltage=${batteryVoltage}V")
-        }
-    }
+    private var lastStoredLocation: Location? = null
+    private var lastSyncTime = 0L
+    private var isServiceDestroyed = false
+    private var foregroundAttempted = false
 
     override fun onCreate() {
         super.onCreate()
@@ -77,49 +59,90 @@ class DataCollectionService : Service(), LocationListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "🎯 Service onStartCommand() called - startId: $startId")
         
+        // Handle pause/stop action from notification
+        when (intent?.action) {
+            ACTION_PAUSE_SERVICE -> {
+                Log.d(TAG, "⏸️ Pause action received from notification")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_SERVICE -> {
+                Log.d(TAG, "🛑 Stop action received from notification")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        
+        // Check if we have necessary permissions to continue
+        if (!hasMinimumPermissions()) {
+            Log.w(TAG, "⚠️ Insufficient permissions - stopping service")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        
         // Ensure foreground service is started (in case onCreate was not called)
         ensureForegroundService()
         
         return START_STICKY // Restart service if killed
+    }
+    
+    private fun hasMinimumPermissions(): Boolean {
+        // At minimum, we need phone state permission for signal monitoring
+        val hasPhonePermission = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
+        val hasNetworkPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_NETWORK_STATE) == PackageManager.PERMISSION_GRANTED
+        
+        if (!hasPhonePermission || !hasNetworkPermission) {
+            Log.w(TAG, "⚠️ Missing minimum permissions: PHONE_STATE=$hasPhonePermission, NETWORK_STATE=$hasNetworkPermission")
+            return false
+        }
+        
+        return true
     }
 
     private fun initializeService() {
         try {
             Log.d(TAG, "🔧 Initializing service components...")
             
-        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-            database = TrackingDatabase(this)
-
-        val retrofit = Retrofit.Builder()
-                .baseUrl("http://avl.valstracking.com:8080")
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-
-        apiService = retrofit.create(ApiService::class.java)
-
-        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        startLocationUpdates()
-        startDataCollection()
-            startOfflineSync()
+            // Check permissions before starting location features
+            if (!hasLocationPermission()) {
+                Log.w(TAG, "⚠️ Location permission not granted - skipping location features")
+                // Still initialize other components
+                initializeBasicComponents()
+                return
+            }
             
-            // NEW: Register GNSS status callback for satellites (API 24+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                locationManager.registerGnssStatusCallback(object : GnssStatus.Callback() {
-                    override fun onSatelliteStatusChanged(status: GnssStatus) {
-                        satelliteCount = status.satelliteCount
-                        Log.d(TAG, "GNSS satellites: $satelliteCount")
-                    }
-                }, Handler(Looper.getMainLooper()))
+            // Initialize database and API
+            database = TrackingDatabase(this)
+            val retrofit = Retrofit.Builder()
+                .baseUrl("http://avl.valstracking.com:8080")
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+            apiService = retrofit.create(ApiService::class.java)
+
+            // Initialize modularized monitors
+            batteryMonitor = BatteryMonitor(this)
+            signalMonitor = SignalMonitor(this)
+            satelliteMonitor = SatelliteMonitor(this)
+            locationManager = com.valsgroup.vtpl.utils.LocationManager(this)
+
+            // Initialize network monitoring
+            NetworkUtils.initializeNetworkMonitoring(this)
+            NetworkUtils.onNetworkRestored = {
+                serviceScope.launch {
+                    Log.d(TAG, "🔄 Network restored - triggering immediate sync")
+                    syncOldestUnsyncedEntry()
+                }
             }
 
-            // NEW: Register PhoneStateListener for GSM signal level
-            telephonyManager.listen(object : PhoneStateListener() {
-                override fun onSignalStrengthsChanged(signalStrength: SignalStrength?) {
-                    gsmSignalLevel = signalStrength?.level ?: 0 // 0-4 (API 23+)
-                    Log.d(TAG, "GSM signal level: $gsmSignalLevel")
-                }
-            }, PhoneStateListener.LISTEN_SIGNAL_STRENGTHS)
+            // Start all monitors
+            batteryMonitor.startMonitoring()
+            signalMonitor.startMonitoring()
+            satelliteMonitor.startMonitoring()
+            startLocationUpdates()
+            
+            // Start new flow jobs
+            startLocationChecking()
+            startPeriodicSync()
             
             Log.d(TAG, "✅ Service initialization completed")
         } catch (e: Exception) {
@@ -127,9 +150,59 @@ class DataCollectionService : Service(), LocationListener {
             stopSelf()
         }
     }
+    
+    private fun initializeBasicComponents() {
+        try {
+            Log.d(TAG, "🔧 Initializing basic service components...")
+            
+            // Initialize database and API
+            database = TrackingDatabase(this)
+            val retrofit = Retrofit.Builder()
+                .baseUrl("http://avl.valstracking.com:8080")
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+            apiService = retrofit.create(ApiService::class.java)
+
+            // Initialize basic monitors (no location)
+            batteryMonitor = BatteryMonitor(this)
+            signalMonitor = SignalMonitor(this)
+
+            // Initialize network monitoring
+            NetworkUtils.initializeNetworkMonitoring(this)
+            NetworkUtils.onNetworkRestored = {
+                serviceScope.launch {
+                    Log.d(TAG, "🔄 Network restored - triggering immediate sync")
+                    syncOldestUnsyncedEntry()
+                }
+            }
+
+            // Start basic monitors
+            batteryMonitor.startMonitoring()
+            signalMonitor.startMonitoring()
+            
+            // Start periodic sync for existing data
+            startPeriodicSync()
+            
+            Log.d(TAG, "✅ Basic service initialization completed")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error initializing basic service components", e)
+            stopSelf()
+        }
+    }
+    
+    private fun hasLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+               ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    }
 
     private fun ensureForegroundService() {
         try {
+            // Only attempt foreground once per service lifecycle
+            if (foregroundAttempted) {
+                Log.d(TAG, "🔄 Foreground already attempted - continuing without foreground mode")
+                return
+            }
+            
             Log.d(TAG, "🛡️ Ensuring foreground service is started...")
             
             // Check if already in foreground
@@ -147,22 +220,34 @@ class DataCollectionService : Service(), LocationListener {
             }
             
             val notification = createNotification()
-            startForeground(NOTIFICATION_ID, notification)
-            Log.d(TAG, "✅ startForeground() called successfully")
+            
+            // Try to start foreground without specifying type first
+            try {
+                startForeground(NOTIFICATION_ID, notification)
+                Log.d(TAG, "✅ startForeground() called successfully")
+                foregroundAttempted = true
+            } catch (e: SecurityException) {
+                Log.w(TAG, "⚠️ Security exception starting foreground service, trying alternative approach", e)
+                // Try alternative approach - just start the service normally
+                Log.d(TAG, "🔄 Starting service without foreground mode")
+                foregroundAttempted = true
+            } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
+                Log.w(TAG, "⚠️ Foreground service time limit exhausted, continuing without foreground mode", e)
+                // Time limit hit - continue without foreground
+                Log.d(TAG, "🔄 Continuing service without foreground mode due to time limit")
+                foregroundAttempted = true
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error calling startForeground()", e)
+                // Continue without foreground mode
+                Log.d(TAG, "🔄 Continuing service without foreground mode")
+                foregroundAttempted = true
+            }
             
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error calling startForeground()", e)
-            
-            // Try with fallback notification
-            try {
-                Log.d(TAG, "🔄 Attempting with fallback notification...")
-                val fallbackNotification = createFallbackNotification()
-                startForeground(NOTIFICATION_ID, fallbackNotification)
-                Log.d(TAG, "✅ startForeground() with fallback successful")
-            } catch (e2: Exception) {
-                Log.e(TAG, "❌ Fatal: Could not start foreground service even with fallback", e2)
-                stopSelf()
-            }
+            Log.e(TAG, "❌ Error in ensureForegroundService", e)
+            // Continue without foreground mode
+            Log.d(TAG, "🔄 Continuing service without foreground mode")
+            foregroundAttempted = true
         }
     }
 
@@ -187,13 +272,33 @@ class DataCollectionService : Service(), LocationListener {
             PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Create pause action
+        val pauseIntent = Intent(this, DataCollectionService::class.java).apply {
+            action = ACTION_PAUSE_SERVICE
+        }
+        val pausePendingIntent = PendingIntent.getService(
+            this, 0, pauseIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Create stop action
+        val stopIntent = Intent(this, DataCollectionService::class.java).apply {
+            action = ACTION_STOP_SERVICE
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this, 0, stopIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("VTPL Data Collection")
             .setContentText("Collecting device data...")
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
-                .setOngoing(true)
-                .build()
+            .addAction(android.R.drawable.ic_media_pause, "Pause", pausePendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
+            .setOngoing(true)
+            .build()
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error creating notification", e)
             throw e
@@ -225,234 +330,238 @@ class DataCollectionService : Service(), LocationListener {
     }
 
     private fun startLocationUpdates() {
-        try {
-            Log.d(TAG, "📍 Starting location updates...")
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                1000, // 1 second
-                1f,   // 1 meter
-                this
-            )
-            Log.d(TAG, "✅ GPS location updates started")
-        } catch (e: SecurityException) {
-            Log.e(TAG, "❌ Security exception requesting location updates", e)
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error requesting location updates", e)
+        locationJob = serviceScope.launch {
+            try {
+                Log.d(TAG, "📍 Starting location updates...")
+                locationManager.getLocationUpdates()
+                    .collect { location ->
+                        currentLocation = location
+                        Log.d(TAG, "📍 Location updated: ${location.latitude}, ${location.longitude}")
+                    }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error in location updates", e)
+            }
         }
     }
 
-    private fun startDataCollection() {
-        job = CoroutineScope(Dispatchers.Default).launch {
-            Log.d(TAG, "📊 Starting data collection job...")
+    private fun startLocationChecking() {
+        locationCheckJob = serviceScope.launch {
+            Log.d(TAG, "📍 Starting location checking job (every 1 second)...")
             while (isActive) {
                 try {
-                collectAndSendData()
-                    val prefs = getSharedPreferences("VTPL_PREFS", Context.MODE_PRIVATE)
-                    val mode = prefs.getString("MODE", "Normal") ?: "Normal"
-                    val interval = when (mode) {
-                        "Realtime" -> 1000L // 1 second
-                        else -> 60000L // 1 minute for Normal and others
-                    }
-                    Log.d(TAG, "⏱️ Data collection completed, waiting ${interval}ms for next cycle (Mode: $mode)")
-                    delay(interval)
+                    checkLocationAndSave()
+                    delay(1000) // Check every 1 second
                 } catch (e: CancellationException) {
-                    Log.d(TAG, "🛑 Data collection loop cancelled - service stopping")
-                    break // Exit the loop when cancelled
+                    Log.d(TAG, "🛑 Location checking loop cancelled")
+                    break
                 } catch (e: Exception) {
-                    Log.e(TAG, "❌ Error in data collection loop", e)
-                    delay(5000) // Wait 5 seconds before retrying
+                    Log.e(TAG, "❌ Error in location checking loop", e)
+                    delay(5000)
                 }
             }
         }
     }
 
-    private fun startOfflineSync() {
-        syncJob = CoroutineScope(Dispatchers.Default).launch {
-            Log.d(TAG, "🔄 Starting offline sync job...")
+    private fun startPeriodicSync() {
+        syncJob = serviceScope.launch {
+            Log.d(TAG, "🔄 Starting periodic sync job (every 15 seconds)...")
             while (isActive) {
                 try {
-                    // Check if there's offline data to sync and main data collection is not in progress
-                    val unsyncedCount = database.getUnsyncedCount()
-                    if (unsyncedCount > 0 && NetworkUtils.isNetworkAvailable(this@DataCollectionService) && !isMainDataCollectionInProgress) {
-                        Log.d(TAG, "🔄 Found $unsyncedCount offline entries - syncing every 5 seconds")
-                        syncOfflineData()
-                        delay(OFFLINE_SYNC_INTERVAL) // 5 seconds delay for offline sync
-                    } else {
-                        if (isMainDataCollectionInProgress) {
-                            Log.d(TAG, "⏸️ Offline sync paused - main data collection in progress")
-                        }
-                        // No offline data or no network - check less frequently
-                        delay(30000) // 30 seconds delay when no offline sync needed
-                    }
+                    syncOldestUnsyncedEntry()
+                    delay(15_000) // Sync every 15 seconds
                 } catch (e: CancellationException) {
-                    Log.d(TAG, "🛑 Offline sync loop cancelled - service stopping")
-                    break // Exit the loop when cancelled
+                    Log.d(TAG, "🛑 Periodic sync loop cancelled")
+                    break
                 } catch (e: Exception) {
-                    Log.e(TAG, "❌ Error in offline sync loop", e)
-                    delay(10000) // Wait 10 seconds before retrying
+                    Log.e(TAG, "❌ Error in periodic sync loop", e)
+                    delay(5000)
                 }
             }
         }
     }
 
-    private suspend fun collectAndSendData() {
-        try {
-            // Set flag to pause offline sync during main data collection
-            isMainDataCollectionInProgress = true
-            Log.d(TAG, "🚀 Starting main data collection (1-minute interval)")
+    private suspend fun checkLocationAndSave() {
+        val location = currentLocation ?: return
+        
+        // Check if we have a previous location to compare with
+        if (lastStoredLocation != null) {
+            val distance = location.distanceTo(lastStoredLocation!!)
             
-            // Get phone number from SharedPreferences
+            if (distance >= LOCATION_CHANGE_THRESHOLD) {
+                Log.d(TAG, "📍 Location changed by ${"%.2f".format(distance)}m (threshold: ${LOCATION_CHANGE_THRESHOLD}m) - saving to database")
+                saveLocationToDatabase(location)
+                lastStoredLocation = location
+            } else {
+                Log.d(TAG, "📍 Location change: ${"%.2f".format(distance)}m (below threshold) - skipping save")
+            }
+        } else {
+            // First location, always save
+            Log.d(TAG, "📍 First location received - saving to database")
+            saveLocationToDatabase(location)
+            lastStoredLocation = location
+        }
+    }
+
+    private suspend fun saveLocationToDatabase(location: Location) {
+        try {
+            // Check if service is being destroyed
+            if (isServiceDestroyed) {
+                Log.d(TAG, "🛑 Service is being destroyed - skipping location save")
+                return
+            }
+            
             val phoneNumber = getSharedPreferences("VTPL_PREFS", Context.MODE_PRIVATE)
                 .getString("PHONE_NUMBER", "Unknown")
 
-            val location = currentLocation
-            if (location != null) {
-                // Check if location has changed significantly (1 meter threshold)
-                val lastLocation = database.getLastLocation()
-                var shouldStoreData = true
-                
-                if (lastLocation != null) {
-                    val lastLocationObj = Location("last").apply {
-                        latitude = lastLocation.first
-                        longitude = lastLocation.second
-                    }
-                    
-                    val distance = location.distanceTo(lastLocationObj)
-                    shouldStoreData = distance >= LOCATION_CHANGE_THRESHOLD
-                    
-                    Log.d(TAG, "Location change: ${"%.2f".format(distance)}m (threshold: ${LOCATION_CHANGE_THRESHOLD}m), storing: $shouldStoreData")
-                }
+            val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+            val deviceDate = dateFormat.format(Date())
 
-                if (shouldStoreData) {
-                    // Format date as required by server: "YYYY-MM-DD HH:MM:SS"
-                    val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-                    val deviceDate = dateFormat.format(Date())
+            // Collect current values from monitors
+            val currentBatteryLevel = batteryMonitor.batteryLevel.value
+            val currentIsCharging = batteryMonitor.isCharging.value
+            val currentBatteryVoltage = batteryMonitor.batteryVoltage.value
+            val currentSignalLevel = signalMonitor.signalLevel.value
+            val currentSatelliteCount = satelliteMonitor.satelliteCount.value
 
-                val deviceData = DeviceData(
-                        imei_id = phoneNumber ?: "Unknown",
-                        device_date = deviceDate,
-                        latitude = String.format(Locale.US, "%.7f", location.latitude).toDouble(),
-                        longitude = String.format(Locale.US, "%.7f", location.longitude).toDouble(),
-                        altitude = String.format(Locale.US, "%.7f", location.altitude).toDouble().toInt(),
-                        satellites = satelliteCount, // DYNAMIC
-                        gsm_signal_level = gsmSignalLevel, // DYNAMIC
-                        battery_power = if (isCharging) "Y" else "N",
-                        battery_level = batteryLevel.toInt(),
-                        battery_voltage = batteryVoltage, // DYNAMIC
-                        external_voltage = 0.0f // Still hardcoded
-                    )
+            val deviceData = DeviceData(
+                imei_id = phoneNumber ?: "Unknown",
+                device_date = deviceDate,
+                latitude = String.format(Locale.US, "%.7f", location.latitude).toDouble(),
+                longitude = String.format(Locale.US, "%.7f", location.longitude).toDouble(),
+                altitude = String.format(Locale.US, "%.7f", location.altitude).toDouble().toInt(),
+                satellites = currentSatelliteCount,
+                gsm_signal_level = currentSignalLevel,
+                battery_power = if (currentIsCharging) "Y" else "N",
+                battery_level = currentBatteryLevel.toInt(),
+                battery_voltage = currentBatteryVoltage,
+                external_voltage = 0.0f
+            )
 
-                    Log.d(TAG, "📡 Main data collection: Phone=${deviceData.imei_id}, Date=${deviceData.device_date}, Lat=${"%.4f".format(deviceData.latitude)}, Lng=${"%.4f".format(deviceData.longitude)}")
-
-                    // Check if network is available for direct send
-                    if (NetworkUtils.isNetworkAvailable(this)) {
-                        Log.d(TAG, "🌐 Internet available - attempting direct send to server")
-                        try {
-                            val response = apiService.sendDeviceData("Bearer $AUTH_TOKEN", "application/json", deviceData)
-                            if (response.isSuccessful) {
-                                Log.d(TAG, "✅ Main data sent successfully to server")
-                                // Store in database as synced since it was sent successfully
-                                val entryId = database.insertTrackingData(deviceData)
-                                database.markAsSynced(entryId)
-                                Log.d(TAG, "💾 Stored and marked as synced (ID: $entryId)")
-                            } else {
-                                Log.e(TAG, "❌ Failed to send main data: ${response.code()} - ${response.message()}")
-                                // Store in database as unsynced for later retry
-                                val entryId = database.insertTrackingData(deviceData)
-                                Log.d(TAG, "💾 Stored as unsynced for later retry (ID: $entryId)")
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "❌ Error sending main data", e)
-                            // Store in database as unsynced for later retry
-                            val entryId = database.insertTrackingData(deviceData)
-                            Log.d(TAG, "💾 Stored as unsynced for later retry (ID: $entryId)")
-                        }
-                    } else {
-                        Log.d(TAG, "📱 No internet - storing data offline")
-                        // No network available, store offline
-                        val entryId = database.insertTrackingData(deviceData)
-                        Log.d(TAG, "💾 Stored offline (ID: $entryId) - will sync when internet returns")
-                    }
-                } else {
-                    Log.d(TAG, "⏭️ Skipping data storage - location change below threshold")
-                }
-            } else {
-                Log.d(TAG, "📍 Location not available yet")
-            }
-            
-            // Clear flag to resume offline sync
-            isMainDataCollectionInProgress = false
-            Log.d(TAG, "✅ Main data collection completed - resuming offline sync")
+            // Save to database as unsynced
+            val entryId = database.insertTrackingData(deviceData)
+            Log.d(TAG, "💾 Saved location to database (ID: $entryId): Lat=${"%.4f".format(deviceData.latitude)}, Lng=${"%.4f".format(deviceData.longitude)}")
             
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in collectAndSendData", e)
-            // Clear flag even on error to prevent permanent blocking
-            isMainDataCollectionInProgress = false
+            Log.e(TAG, "❌ Error saving location to database", e)
         }
     }
 
-    private suspend fun syncOfflineData() {
-        if (!NetworkUtils.isNetworkAvailable(this)) {
+
+
+    private suspend fun syncOldestUnsyncedEntry() {
+        if (!NetworkUtils.isNetworkAvailable.value) {
+            Log.d(TAG, "📱 No network available - skipping sync")
             return
         }
-        
+
+        // Check if service is being destroyed
+        if (isServiceDestroyed) {
+            Log.d(TAG, "🛑 Service is being destroyed - skipping sync")
+            return
+        }
+
         val unsyncedEntries = database.getUnsyncedEntries()
         if (unsyncedEntries.isNotEmpty()) {
-            Log.d(TAG, "🔄 Offline sync: processing ${unsyncedEntries.size} entries")
+            // Get the oldest unsynced entry
+            val oldestEntry = unsyncedEntries.first()
             
-            var successCount = 0
-            var failureCount = 0
-            
-            for (entry in unsyncedEntries) {
-                try {
-                    val deviceData = entry.toDeviceData()
-                    Log.d(TAG, "📤 Syncing offline entry ${entry.id}: Lat=${"%.4f".format(deviceData.latitude)}, Lng=${"%.4f".format(deviceData.longitude)}")
+            try {
+                Log.d(TAG, "📤 Syncing oldest unsynced entry ${oldestEntry.id}: Lat=${"%.4f".format(oldestEntry.latitude)}, Lng=${"%.4f".format(oldestEntry.longitude)}")
+                
+                val deviceData = oldestEntry.toDeviceData()
+                val response = apiService.sendDeviceData("Bearer $AUTH_TOKEN", "application/json", deviceData)
+                
+                if (response.isSuccessful) {
+                    database.markAsSynced(oldestEntry.id)
+                    Log.d(TAG, "✅ Synced entry ${oldestEntry.id} successfully")
+                    Log.i(TAG, "📤 SYNCED: ${deviceData.imei_id} | ${deviceData.device_date} | Lat:${"%.4f".format(deviceData.latitude)} | Lng:${"%.4f".format(deviceData.longitude)} | Battery:${deviceData.battery_level}% | Signal:${deviceData.gsm_signal_level}")
                     
-                    val response = apiService.sendDeviceData("Bearer $AUTH_TOKEN", "application/json", deviceData)
+                    // Clean up old synced entries (older than 24 hours)
+                    deleteOldSyncedEntries()
                     
-                    if (response.isSuccessful) {
-                        database.markAsSynced(entry.id)
-                        successCount++
-                        Log.d(TAG, "✅ Synced offline entry ${entry.id}")
-                    } else {
-                        failureCount++
-                        Log.e(TAG, "❌ Failed to sync offline entry ${entry.id}: ${response.code()}")
-                    }
-                } catch (e: Exception) {
-                    failureCount++
-                    Log.e(TAG, "❌ Error syncing offline entry ${entry.id}: ${e.message}")
+                } else {
+                    Log.e(TAG, "❌ Failed to sync entry ${oldestEntry.id}: ${response.code()} - ${response.message()}")
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error syncing entry ${oldestEntry.id}", e)
             }
-            
-            Log.d(TAG, "📊 Offline sync completed: $successCount successful, $failureCount failed")
-            
-            if (failureCount == 0 && successCount > 0) {
-                Log.d(TAG, "🎉 All offline data synced successfully!")
-            }
+        } else {
+            Log.d(TAG, "📭 No unsynced entries to sync")
         }
     }
 
-    override fun onLocationChanged(location: Location) {
-        currentLocation = location
+    private suspend fun deleteOldSyncedEntries() {
+        try {
+            // Check if service is being destroyed
+            if (isServiceDestroyed) {
+                Log.d(TAG, "🛑 Service is being destroyed - skipping cleanup")
+                return
+            }
+            
+            // Calculate timestamp for 24 hours ago
+            val twentyFourHoursAgo = System.currentTimeMillis() - (24 * 60 * 60 * 1000)
+            val deletedCount = database.deleteOldSyncedEntries(twentyFourHoursAgo)
+            if (deletedCount > 0) {
+                Log.d(TAG, "🗑️ Deleted $deletedCount old synced entries (older than 24 hours)")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error deleting old synced entries", e)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
-        job?.cancel()
+        
+        Log.d(TAG, "🛑 Service onDestroy() called")
+        
+        // Set flag to prevent new operations
+        isServiceDestroyed = true
+        
+        // Cancel all coroutine jobs first
+        locationCheckJob?.cancel()
         syncJob?.cancel()
-        unregisterReceiver(batteryReceiver)
-        locationManager.removeUpdates(this)
-        database.close()
+        locationJob?.cancel()
+        serviceScope.cancel()
+        
+        // Wait a bit for jobs to finish gracefully
+        try {
+            Thread.sleep(200)
+        } catch (e: InterruptedException) {
+            Log.d(TAG, "Interrupted while waiting for jobs to finish")
+        }
+        
+        // Stop all monitors
+        try {
+            batteryMonitor.stopMonitoring()
+            signalMonitor.stopMonitoring()
+            satelliteMonitor.stopMonitoring()
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error stopping monitors", e)
+        }
+        
+        // Clean up network monitoring
+        NetworkUtils.cleanupNetworkMonitoring(this)
+        
+        // Close database last
+        try {
+            database.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error closing database", e)
+        }
+        
+        Log.d(TAG, "🛑 Service destroyed and cleaned up")
     }
 
     companion object {
         private const val TAG = "DataCollectionService"
         private const val NOTIFICATION_ID = 1
-        private const val AUTH_TOKEN = "vtpliveviewvwep" // Replace with your actual auth token
-        private const val LOCATION_CHANGE_THRESHOLD = 1.0f // 1 meter threshold for location changes
-        private const val OFFLINE_SYNC_INTERVAL = 5000L // 5 seconds for offline data syncing
+        private const val AUTH_TOKEN = "vtpliveviewvwep"
+        // Distance filter for when to persist a new point. Adjust as needed.
+        private const val LOCATION_CHANGE_THRESHOLD = 10.0f // meters
+        const val ACTION_STOP_SERVICE = "com.valsgroup.vtpl.STOP_SERVICE"
+        const val ACTION_PAUSE_SERVICE = "com.valsgroup.vtpl.PAUSE_SERVICE"
 
         fun startService(context: Context) {
             val serviceIntent = Intent(context, DataCollectionService::class.java)
@@ -466,6 +575,16 @@ class DataCollectionService : Service(), LocationListener {
         fun stopService(context: Context) {
             val serviceIntent = Intent(context, DataCollectionService::class.java)
             context.stopService(serviceIntent)
+        }
+
+        fun isServiceRunning(context: Context): Boolean {
+            val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            for (service in manager.getRunningServices(Integer.MAX_VALUE)) {
+                if (DataCollectionService::class.java.name == service.service.className) {
+                    return true
+                }
+            }
+            return false
         }
     }
 }

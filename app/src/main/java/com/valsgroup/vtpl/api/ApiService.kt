@@ -1,9 +1,12 @@
 package com.valsgroup.vtpl.api
 
+import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.POST
 import retrofit2.http.Header
+import retrofit2.http.GET
+import retrofit2.http.Path
 
 interface ApiService {
     @POST("/mobdata")
@@ -12,7 +15,21 @@ interface ApiService {
         @Header("Content-Type") contentType: String = "application/json",
         @Body data: DeviceData
     ): Response<Unit>
+
+    @GET("/vtp/imeistatus/{phone}")
+    suspend fun checkImeiStatus(
+        @Header("Authorization") authToken: String,
+        @Path("phone") phone: String
+    ): Response<ImeiStatusResponse>
 }
+
+data class ImeiStatusResponse(
+    val status: String,
+    val imei_id: Long,
+    val user_id: String,
+    val user_status: String,
+    val tagging: String
+)
 
 data class DeviceData(
     val imei_id: String,

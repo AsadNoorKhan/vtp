@@ -126,6 +126,45 @@ class TrackingDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NA
         return entries
     }
 
+    fun getEntriesAfterTime(timestamp: Long): List<TrackingEntry> {
+        val entries = mutableListOf<TrackingEntry>()
+        val db = this.readableDatabase
+        
+        val cursor = db.query(
+            TABLE_NAME,
+            null,
+            "$COLUMN_CREATED_AT >= ?",
+            arrayOf(timestamp.toString()),
+            null,
+            null,
+            "$COLUMN_CREATED_AT ASC"
+        )
+
+        while (cursor.moveToNext()) {
+            val entry = TrackingEntry(
+                id = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_ID)),
+                imei_id = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_IMEI_ID)),
+                device_date = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_DEVICE_DATE)),
+                latitude = cursor.getDouble(cursor.getColumnIndexOrThrow(COLUMN_LATITUDE)),
+                longitude = cursor.getDouble(cursor.getColumnIndexOrThrow(COLUMN_LONGITUDE)),
+                altitude = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_ALTITUDE)),
+                satellites = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_SATELLITES)),
+                gsm_signal_level = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_GSM_SIGNAL_LEVEL)),
+                battery_power = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_BATTERY_POWER)),
+                battery_level = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_BATTERY_LEVEL)),
+                battery_voltage = cursor.getFloat(cursor.getColumnIndexOrThrow(COLUMN_BATTERY_VOLTAGE)),
+                external_voltage = cursor.getFloat(cursor.getColumnIndexOrThrow(COLUMN_EXTERNAL_VOLTAGE)),
+                created_at = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_CREATED_AT)),
+                synced = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_SYNCED)) == 1
+            )
+            entries.add(entry)
+        }
+        
+        cursor.close()
+        db.close()
+        return entries
+    }
+
     fun markAsSynced(id: Long) {
         val db = this.writableDatabase
         val values = ContentValues().apply {
@@ -187,6 +226,71 @@ class TrackingDatabase(context: Context) : SQLiteOpenHelper(context, DATABASE_NA
         
         Log.d("TrackingDatabase", "Cleared $deletedRows synced entries")
     }
+    
+    fun deleteOldSyncedEntries(olderThanTimestamp: Long): Int {
+        val db = this.writableDatabase
+        val deletedRows = db.delete(
+            TABLE_NAME, 
+            "$COLUMN_SYNCED = ? AND $COLUMN_CREATED_AT < ?", 
+            arrayOf("1", olderThanTimestamp.toString())
+        )
+        db.close()
+        
+        Log.d("TrackingDatabase", "Deleted $deletedRows old synced entries (older than ${Date(olderThanTimestamp)})")
+        return deletedRows
+    }
+    
+    fun deleteOldestSyncedEntry(): Int {
+        val db = this.writableDatabase
+        
+        // First, find the oldest synced entry
+        val cursor = db.query(
+            TABLE_NAME,
+            arrayOf(COLUMN_ID),
+            "$COLUMN_SYNCED = ?",
+            arrayOf("1"),
+            null,
+            null,
+            "$COLUMN_CREATED_AT ASC",
+            "1"
+        )
+        
+        return if (cursor.moveToFirst()) {
+            val oldestId = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_ID))
+            cursor.close()
+            
+            // Delete the oldest synced entry
+            val deletedRows = db.delete(TABLE_NAME, "$COLUMN_ID = ?", arrayOf(oldestId.toString()))
+            db.close()
+            
+            Log.d("TrackingDatabase", "Deleted oldest synced entry with ID: $oldestId")
+            deletedRows
+        } else {
+            cursor.close()
+            db.close()
+            Log.d("TrackingDatabase", "No synced entries found to delete")
+            0
+        }
+    }
+    
+    fun getDatabaseStats(): DatabaseStats {
+        val db = this.readableDatabase
+        
+        val totalCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_NAME", null)
+        val syncedCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_NAME WHERE $COLUMN_SYNCED = 1", null)
+        val unsyncedCursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_NAME WHERE $COLUMN_SYNCED = 0", null)
+        
+        val total = if (totalCursor.moveToFirst()) totalCursor.getInt(0) else 0
+        val synced = if (syncedCursor.moveToFirst()) syncedCursor.getInt(0) else 0
+        val unsynced = if (unsyncedCursor.moveToFirst()) unsyncedCursor.getInt(0) else 0
+        
+        totalCursor.close()
+        syncedCursor.close()
+        unsyncedCursor.close()
+        db.close()
+        
+        return DatabaseStats(total, synced, unsynced)
+    }
 }
 
 data class TrackingEntry(
@@ -220,4 +324,13 @@ data class TrackingEntry(
             external_voltage = external_voltage
         )
     }
+}
+
+data class DatabaseStats(
+    val totalEntries: Int,
+    val syncedEntries: Int,
+    val unsyncedEntries: Int
+) {
+    val syncPercentage: Double
+        get() = if (totalEntries > 0) (syncedEntries.toDouble() / totalEntries) * 100 else 0.0
 } 
